@@ -1,0 +1,171 @@
+#include <SPI.h>
+#include <math.h>
+
+// Pines del Arduino Nano
+const byte CS_ROJO = 10;
+const byte CS_IR = 9;
+
+// Configuracion de los DAC
+const float VREF = 5.0;
+const unsigned long INTERVALO_US = 10000; // 100 muestras/s
+
+// Parametros iniciales
+int HR = 75;
+int SpO2 = 95;
+
+// Amplitudes originales de la tesis, SpO2 100 a 50
+const float ampR[] = {
+  0.3,0.4,0.4,0.4,0.4,0.3,0.3,0.4,0.4,0.4,
+  0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.5,0.4,
+  0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,
+  0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,
+  0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,
+  0.4
+};
+
+const float ampIR[] = {
+  1.0,0.9,0.7,1.0,0.9,0.7,0.7,0.6,0.6,0.58,
+  0.57,0.54,0.52,0.5,0.5,0.48,0.47,0.46,
+  0.45,0.445,0.44,0.43,0.42,0.39,0.4,
+  0.39,0.38,0.38,0.37,0.35,0.36,0.35,
+  0.35,0.34,0.34,0.34,0.33,0.32,0.32,
+  0.31,0.3,0.3,0.3,0.29,0.29,0.28,
+  0.28,0.27,0.27,0.26,0.25
+};
+
+const float minR = 1.45;
+const float minIR = 1.45;
+
+unsigned long ultimoTiempo = 0;
+unsigned long inicioOnda = 0;
+
+char comando[24];
+byte posicion = 0;
+
+// Enviar un valor de 10 bits al MCP4911
+void escribirDAC(byte cs, uint16_t valor) {
+  if (valor > 1023) valor = 1023;
+
+  // MCP4911: activo, ganancia 1x, sin buffer
+  uint16_t dato = 0x3000 | (valor << 2);
+
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(cs, LOW);
+  SPI.transfer16(dato);
+  digitalWrite(cs, HIGH);
+  SPI.endTransaction();
+}
+
+// Convertir voltios a codigo digital
+uint16_t convertirVoltaje(float voltaje) {
+  voltaje = constrain(voltaje, 0.0f, VREF);
+  return (uint16_t)(voltaje * 1023.0f / VREF + 0.5f);
+}
+
+// Generacion de las ondas PPG
+void generarPPG(unsigned long tiempoActual) {
+  int indice = 100 - SpO2;
+
+  float t = (tiempoActual - inicioOnda) / 1000000.0f;
+  float f = HR / 60.0f;
+
+  // Funcion del Anexo A de la tesis
+  float alfa =
+      0.5f * sin(2.0f * PI * f * t)
+    + 0.22f * sin(4.0f * PI * f * t + 40.0f);
+
+  float ondaRoja = minR + ampR[indice] * alfa;
+  float ondaIR = minIR + ampIR[indice] * alfa;
+
+  // Escalado de demostracion: mantener las
+  // amplitudes calculadas dentro de 0 a 5 V.
+  escribirDAC(CS_ROJO, convertirVoltaje(ondaRoja));
+  escribirDAC(CS_IR, convertirVoltaje(ondaIR));
+}
+
+// Leer comandos HR,SpO2
+void procesarComando(char *texto) {
+  char *coma = strchr(texto, ',');
+  if (coma == NULL) {
+    Serial.println(F("Formato: HR,SpO2"));
+    return;
+  }
+
+  *coma = '\0';
+  char *parteHR = texto;
+  char *parteSpO2 = coma + 1;
+
+  int nuevoHR = HR;
+  int nuevaSpO2 = SpO2;
+
+  if (strcmp(parteHR, "x") != 0 &&
+      strcmp(parteHR, "X") != 0) {
+    nuevoHR = atoi(parteHR);
+  }
+
+  if (strcmp(parteSpO2, "x") != 0 &&
+      strcmp(parteSpO2, "X") != 0) {
+    nuevaSpO2 = atoi(parteSpO2);
+  }
+
+  if (nuevoHR < 30 || nuevoHR > 200 ||
+      nuevaSpO2 < 50 || nuevaSpO2 > 100) {
+    Serial.println(F("HR: 30-200; SpO2: 50-100"));
+    return;
+  }
+
+  HR = nuevoHR;
+  SpO2 = nuevaSpO2;
+
+  Serial.print(F("HR = "));
+  Serial.print(HR);
+  Serial.print(F(" ppm | SpO2 = "));
+  Serial.print(SpO2);
+  Serial.println(F("%"));
+}
+
+void leerSerial() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+
+    if (c == '\n' || c == '\r') {
+      if (posicion > 0) {
+        comando[posicion] = '\0';
+        procesarComando(comando);
+        posicion = 0;
+      }
+    } else if (posicion < sizeof(comando) - 1) {
+      comando[posicion++] = c;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(10, OUTPUT);
+  pinMode(9, OUTPUT);
+
+  digitalWrite(10, HIGH);
+  digitalWrite(9, HIGH);
+
+  SPI.begin();
+
+  inicioOnda = micros();
+  ultimoTiempo = inicioOnda;
+
+  Serial.println(F("Simulador PPG - Arduino Nano"));
+  Serial.println(F("Introduce HR,SpO2"));
+  Serial.println(F("Ejemplo: 75,95"));
+}
+
+void loop() {
+  leerSerial();
+
+  unsigned long ahora = micros();
+
+  if ((unsigned long)(ahora - ultimoTiempo) >= INTERVALO_US) {
+    ultimoTiempo += INTERVALO_US;
+    generarPPG(ahora);
+  }
+}
